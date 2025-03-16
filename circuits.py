@@ -3,6 +3,9 @@ import torch
 import pandas as pd
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 from dataset import generate_dataset_per_permutation
+import pickle
+import os
+
 # -------------------------------
 # Load GPT-2 small and set to eval mode.
 # -------------------------------
@@ -15,6 +18,14 @@ model.eval()
 # Generate dataset with 100 samples per permutation.
 # -------------------------------
 dataset = generate_dataset_per_permutation(samples_per_perm=100)
+
+# -------------------------------
+# Define cache file paths.
+# -------------------------------
+HEAD_EFFECT_CACHE = "head_effect_results.pkl"
+KNOCKOUT_EFFECT_CACHE = "knockout_effect.pkl"
+CIRCUIT_EVAL_CACHE = "circuit_eval.pkl"
+MINIMAL_CIRCUIT_CACHE = "minimal_circuit.pkl"
 
 # -------------------------------
 # Helper functions
@@ -85,11 +96,7 @@ def path_patch_head(layer_idx: int, head_idx: int, prompt_orig: str, prompt_patc
         batch_size, seq_len, _ = patched.shape
 
         # Ensure patch_activation has a batch dimension.
-        if patch_activation.dim() == 2:
-            patch_act = patch_activation.unsqueeze(0)
-        else:
-            patch_act = patch_activation
-
+        patch_act = patch_activation if patch_activation.dim() == 3 else patch_activation.unsqueeze(0)
         patch_seq_len = patch_act.shape[1]
         min_seq_len = min(seq_len, patch_seq_len)
         # Replace only for the first min_seq_len tokens.
@@ -107,7 +114,6 @@ def path_patch_head(layer_idx: int, head_idx: int, prompt_orig: str, prompt_patc
 
     return outputs_orig.logits
 
-
 def get_logit_diff_path_patch(layer_idx: int, head_idx: int, prompt: str, prompt_patch: str,
                               correct_word: str, incorrect_word: str):
     """Run path patching for a given head and return the computed logit difference."""
@@ -118,7 +124,6 @@ def get_logit_diff_path_patch(layer_idx: int, head_idx: int, prompt: str, prompt
 # Counterfactual generator.
 # For subject-verb agreement, we flip the subject's plurality.
 # -------------------------------
-# (Make sure that these name lists match those used in dataset generation.)
 singular_names = [
     "Alice", "Bob", "Charlie", "Dana", "Eve", "Frank", "Grace", "Hank",
     "Ivy", "Jack", "Kara", "Leo", "Mia", "Nina", "Oscar", "Paul", "Quinn", "Rose", "Sam", "Tina"
@@ -151,14 +156,14 @@ def generate_counterfactual(example: dict) -> dict:
     return new_example
 
 # -------------------------------
-# Systematic analysis over the dataset via path patching.
+# Analysis functions.
 # -------------------------------
 def analyze_head_effects(dataset: list, num_samples: int = 50):
     """
     For each attention head (all layers and heads in GPT-2 small), compute the average effect on the
     logit difference when patching in the activation from a counterfactual example.
     Effect = (baseline logit diff) - (patched logit diff)
-    Returns a list of dictionaries for each head: {layer, head, avg_effect}.
+    Returns a list of dicts for each head: {layer, head, avg_effect}.
     """
     sample_examples = random.sample(dataset, num_samples)
     num_layers = len(model.transformer.h)
@@ -184,16 +189,12 @@ def analyze_head_effects(dataset: list, num_samples: int = 50):
         results.append({"layer": layer, "head": head, "avg_effect": avg_effect})
     return results
 
-# -------------------------------
-# Knockout analysis: zero-out selected heads.
-# -------------------------------
 def zero_hook_factory(head_idx: int):
     """
     Returns a hook function that zeroes out the output for the specified head.
     Handles the case when the module's output is a tuple.
     """
     def hook(module, input, output):
-        # Check if output is a tuple
         if isinstance(output, tuple):
             output_tensor, rest = output[0], output[1:]
             head_dim = output_tensor.shape[-1] // module.num_heads
@@ -239,11 +240,6 @@ def analyze_knockout_effect(heads: list, dataset: list, num_samples: int = 50):
     avg_effect = sum(effects) / len(effects)
     return avg_effect
 
-# -------------------------------
-# Full circuit evaluation.
-# Here we define a "circuit" as a set of candidate heads.
-# We simulate circuit-only behavior by knocking out all heads not in the circuit.
-# -------------------------------
 def evaluate_circuit(circuit_heads: list, dataset: list, num_samples: int = 50):
     """
     Evaluate a circuit by comparing:
@@ -262,8 +258,6 @@ def evaluate_circuit(circuit_heads: list, dataset: list, num_samples: int = 50):
         baseline_logits = get_logits(ex["prompt"])
         full_diff = compute_logit_diff(baseline_logits, ex["correct_verb"], ex["incorrect_verb"])
         full_diffs.append(full_diff)
-        
-        # Knock out all heads not in the circuit.
         heads_to_knockout = [h for h in all_heads if h not in circuit_heads]
         circuit_logits = knockout_heads(heads_to_knockout, ex["prompt"])
         circuit_diff = compute_logit_diff(circuit_logits, ex["correct_verb"], ex["incorrect_verb"])
@@ -275,22 +269,91 @@ def evaluate_circuit(circuit_heads: list, dataset: list, num_samples: int = 50):
     return {"F_full": F_full, "F_circuit": F_circuit, "faithfulness": faithfulness}
 
 # -------------------------------
-# Run the analyses.
+# Caching functions.
 # -------------------------------
-# (Assuming your dataset variable is already defined.)
-head_effect_results = analyze_head_effects(dataset, num_samples=50)
+def save_results(filename, data):
+    with open(filename, "wb") as f:
+        pickle.dump(data, f)
+
+def load_results(filename):
+    if os.path.exists(filename):
+        with open(filename, "rb") as f:
+            return pickle.load(f)
+    return None
+
+# -------------------------------
+# Run and cache analyses.
+# -------------------------------
+# 1. Path patching analysis.
+head_effect_results = load_results(HEAD_EFFECT_CACHE)
+if head_effect_results is None:
+    head_effect_results = analyze_head_effects(dataset, num_samples=50)
+    save_results(HEAD_EFFECT_CACHE, head_effect_results)
 df_effects = pd.DataFrame(head_effect_results)
 df_effects["abs_effect"] = df_effects["avg_effect"].abs()
 df_effects_sorted = df_effects.sort_values("abs_effect", ascending=False)
 print("=== Path Patching Analysis Results (per head) ===")
 print(df_effects_sorted)
 
-# For example, select the top 5 heads (by absolute average effect) as our candidate circuit.
+# 2. Select top 5 heads as candidate circuit and compute knockout effect.
 top5 = df_effects_sorted.head(5)[["layer", "head"]].to_records(index=False)
 top5_list = [(int(x[0]), int(x[1])) for x in top5]
-knockout_effect = analyze_knockout_effect(top5_list, dataset, num_samples=50)
+knockout_effect = load_results(KNOCKOUT_EFFECT_CACHE)
+if knockout_effect is None:
+    knockout_effect = analyze_knockout_effect(top5_list, dataset, num_samples=50)
+    save_results(KNOCKOUT_EFFECT_CACHE, knockout_effect)
 print("\nAverage knockout effect for top 5 candidate heads:", knockout_effect)
 
-circuit_eval = evaluate_circuit(top5_list, dataset, num_samples=50)
+circuit_eval = load_results(CIRCUIT_EVAL_CACHE)
+if circuit_eval is None:
+    circuit_eval = evaluate_circuit(top5_list, dataset, num_samples=50)
+    save_results(CIRCUIT_EVAL_CACHE, circuit_eval)
 print("\nCircuit evaluation (top 5 heads):")
 print(circuit_eval)
+
+# -------------------------------
+# Greedy Minimal Circuit Search.
+# We try to find the smallest set of heads that yields an F_circuit within a threshold of F_full.
+# -------------------------------
+def find_minimal_circuit(sorted_heads, dataset, threshold=0.1, num_samples=50):
+    """
+    Given a list of candidate heads (sorted in descending order by abs_effect),
+    iteratively add one head at a time (greedy) until the relative difference between
+    F_full and F_circuit (faithfulness) is below the threshold.
+    Returns the minimal set and its evaluation.
+    """
+    candidate = []
+    # Start by evaluating with no heads active (i.e. circuit = empty) -- though this usually fails.
+    # So we start with the top candidate.
+    for head in sorted_heads:
+        candidate = [head]
+        eval_candidate = evaluate_circuit(candidate, dataset, num_samples=num_samples)
+        diff = abs(eval_candidate["F_full"] - eval_candidate["F_circuit"]) / eval_candidate["F_full"]
+        print(f"Starting with candidate {candidate}: F_full={eval_candidate['F_full']}, F_circuit={eval_candidate['F_circuit']}, diff={diff:.3f}")
+        if diff < threshold:
+            return candidate, eval_candidate
+        break
+
+    # Now, iteratively add heads.
+    for head in sorted_heads:
+        if head in candidate:
+            continue
+        new_candidate = candidate + [head]
+        eval_new = evaluate_circuit(new_candidate, dataset, num_samples=num_samples)
+        diff = abs(eval_new["F_full"] - eval_new["F_circuit"]) / eval_new["F_full"]
+        print(f"Testing candidate {new_candidate}: F_full={eval_new['F_full']}, F_circuit={eval_new['F_circuit']}, diff={diff:.3f}")
+        # Greedily update candidate if adding head brings F_circuit closer.
+        if diff < abs(evaluate_circuit(candidate, dataset, num_samples=num_samples)["F_full"] - 
+                       evaluate_circuit(candidate, dataset, num_samples=num_samples)["F_circuit"]) / \
+                       evaluate_circuit(candidate, dataset, num_samples=num_samples)["F_full"]:
+            candidate = new_candidate
+        if diff < threshold:
+            return candidate, eval_new
+    return candidate, evaluate_circuit(candidate, dataset, num_samples=num_samples)
+
+# We'll use all heads sorted by absolute effect as our candidate order.
+sorted_candidate_heads = [(int(row["layer"]), int(row["head"])) for _, row in df_effects_sorted.iterrows()]
+minimal_circuit, minimal_eval = find_minimal_circuit(sorted_candidate_heads, dataset, threshold=0.1, num_samples=50)
+save_results(MINIMAL_CIRCUIT_CACHE, (minimal_circuit, minimal_eval))
+print("\nMinimal circuit found (heads):", minimal_circuit)
+print("Minimal circuit evaluation:", minimal_eval)
