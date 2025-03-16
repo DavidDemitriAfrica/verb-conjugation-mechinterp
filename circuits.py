@@ -53,10 +53,15 @@ def path_patch_head(layer_idx: int, head_idx: int, prompt_orig: str, prompt_patc
 
     def capture_hook(module, input, output):
         nonlocal patch_activation
-        # output shape: (batch, seq_length, hidden_size)
+        # If output is a tuple, take the first element.
+        if isinstance(output, tuple):
+            output = output[0]
         head_dim = output.shape[-1] // module.num_heads
-        # Extract the slice corresponding to the specified head.
-        patch_activation = output[..., head_idx * head_dim:(head_idx + 1) * head_dim].clone()
+        patch_activation_local = output[..., head_idx * head_dim:(head_idx + 1) * head_dim].clone()
+        # Ensure a batch dimension is present.
+        if patch_activation_local.dim() == 2:
+            patch_activation_local = patch_activation_local.unsqueeze(0)
+        patch_activation = patch_activation_local
 
     hook_handle = model.transformer.h[layer_idx].attn.register_forward_hook(capture_hook)
     _ = model(**inputs_patch)
@@ -67,9 +72,31 @@ def path_patch_head(layer_idx: int, head_idx: int, prompt_orig: str, prompt_patc
 
     # --- Step 2: Replace the head's output in a forward pass on prompt_orig.
     def replace_hook(module, input, output):
-        head_dim = output.shape[-1] // module.num_heads
-        patched = output.clone()
-        patched[..., head_idx * head_dim:(head_idx + 1) * head_dim] = patch_activation
+        # If output is a tuple, extract the tensor part.
+        tuple_out = False
+        if isinstance(output, tuple):
+            output_tensor, rest = output[0], output[1:]
+            tuple_out = True
+        else:
+            output_tensor = output
+
+        head_dim = output_tensor.shape[-1] // module.num_heads
+        patched = output_tensor.clone()
+        batch_size, seq_len, _ = patched.shape
+
+        # Ensure patch_activation has a batch dimension.
+        if patch_activation.dim() == 2:
+            patch_act = patch_activation.unsqueeze(0)
+        else:
+            patch_act = patch_activation
+
+        patch_seq_len = patch_act.shape[1]
+        min_seq_len = min(seq_len, patch_seq_len)
+        # Replace only for the first min_seq_len tokens.
+        patched[:, :min_seq_len, head_idx * head_dim:(head_idx + 1) * head_dim] = \
+            patch_act[:, :min_seq_len, :]
+        if tuple_out:
+            return (patched,) + rest
         return patched
 
     hook_handle = model.transformer.h[layer_idx].attn.register_forward_hook(replace_hook)
@@ -79,6 +106,7 @@ def path_patch_head(layer_idx: int, head_idx: int, prompt_orig: str, prompt_patc
     hook_handle.remove()
 
     return outputs_orig.logits
+
 
 def get_logit_diff_path_patch(layer_idx: int, head_idx: int, prompt: str, prompt_patch: str,
                               correct_word: str, incorrect_word: str):
@@ -162,12 +190,21 @@ def analyze_head_effects(dataset: list, num_samples: int = 50):
 def zero_hook_factory(head_idx: int):
     """
     Returns a hook function that zeroes out the output for the specified head.
+    Handles the case when the module's output is a tuple.
     """
     def hook(module, input, output):
-        head_dim = output.shape[-1] // module.num_heads
-        patched = output.clone()
-        patched[..., head_idx * head_dim:(head_idx + 1) * head_dim] = 0
-        return patched
+        # Check if output is a tuple
+        if isinstance(output, tuple):
+            output_tensor, rest = output[0], output[1:]
+            head_dim = output_tensor.shape[-1] // module.num_heads
+            patched = output_tensor.clone()
+            patched[..., head_idx * head_dim:(head_idx+1)*head_dim] = 0
+            return (patched,) + rest
+        else:
+            head_dim = output.shape[-1] // module.num_heads
+            patched = output.clone()
+            patched[..., head_idx * head_dim:(head_idx+1)*head_dim] = 0
+            return patched
     return hook
 
 def knockout_heads(heads: list, prompt: str):

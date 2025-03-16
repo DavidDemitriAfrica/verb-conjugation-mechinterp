@@ -1,7 +1,7 @@
 from itertools import product
 import random
 
-def generate_dataset_per_permutation(samples_per_perm=100):
+def generate_dataset_per_permutation(samples_per_perm=100, seed=42):
     """
     Generate a dataset with exactly 'samples_per_perm' samples for each unique permutation
     of conditions:
@@ -14,6 +14,7 @@ def generate_dataset_per_permutation(samples_per_perm=100):
       
     Returns a list of example dictionaries.
     """
+    random.seed(seed)
     dataset = []
     
     # Extended list of names and pronouns.
