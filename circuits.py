@@ -5,6 +5,7 @@ from transformers import GPT2LMHeadModel, GPT2Tokenizer
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from itertools import product
 from dataset import generate_dataset_per_permutation
+from utils import get_logit_diff, get_logits
 
 model_name = "gpt2"
 model = GPT2LMHeadModel.from_pretrained(model_name)
@@ -43,26 +44,6 @@ conditions = list(product([False, True],    # is_plural
                             [False, True],    # is_pronoun
                             ["present", "past"],  # tense
                             [False, True]))   # use_irregular
-# =============================================================================
-# Helper functions for evaluating logit differences.
-# =============================================================================
-def get_logits(prompt):
-    """Return model logits for a given prompt."""
-    inputs = tokenizer(prompt, return_tensors="pt")
-    with torch.no_grad():
-        outputs = model(**inputs)
-    return outputs.logits
-
-def get_logit_diff(logits, correct_word, incorrect_word):
-    """
-    Compute the logit difference (logit[correct] - logit[incorrect]) for the
-    next-token prediction from the given logits.
-    """
-    correct_id = tokenizer.encode(correct_word, add_prefix_space=True)[0]
-    incorrect_id = tokenizer.encode(incorrect_word, add_prefix_space=True)[0]
-    logit_correct = logits[0, -1, correct_id].item()
-    logit_incorrect = logits[0, -1, incorrect_id].item()
-    return logit_correct - logit_incorrect
 
 # =============================================================================
 # Path patching functions.
