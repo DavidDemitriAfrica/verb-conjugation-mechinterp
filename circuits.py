@@ -48,7 +48,7 @@ conditions = list(product([False, True],    # is_plural
 # =============================================================================
 # Path patching functions.
 # =============================================================================
-def path_patch_head(layer_idx, head_idx, prompt_orig, prompt_patch):
+def path_patch_head(layer_idx, head_idx, prompt_orig, prompt_patch, tokenizer=tokenizer, model=model):
     """
     For the given layer and head index, run two forward passes:
       1. On prompt_patch to capture the activation for that head.
@@ -88,13 +88,13 @@ def path_patch_head(layer_idx, head_idx, prompt_orig, prompt_patch):
 
     return outputs_orig.logits
 
-def get_logit_diff_path_patch(layer_idx, head_idx, prompt, prompt_patch, correct_word, incorrect_word):
+def get_logit_diff_path_patch(layer_idx, head_idx, prompt, prompt_patch, correct_word, incorrect_word, tokenizer=tokenizer, model=model):
     """
     Compute the logit difference on `prompt` when patching the activation of a specific
     head (from prompt_patch) into the forward pass.
     """
     patched_logits = path_patch_head(layer_idx, head_idx, prompt, prompt_patch)
-    return get_logit_diff(patched_logits, correct_word, incorrect_word)
+    return get_logit_diff(patched_logits, correct_word, incorrect_word, tokenizer=tokenizer, model=model)
 
 # =============================================================================
 # Define a counterfactual generator.
@@ -127,7 +127,7 @@ def generate_counterfactual(example):
 # =============================================================================
 # Systematic analysis over the dataset via path patching.
 # =============================================================================
-def analyze_head_effects(dataset, num_samples=50):
+def analyze_head_effects(dataset, num_samples=50, model=model, tokenizer=tokenizer):
     """
     For each attention head (all layers and heads in GPT-2 small), compute the average effect on the
     logit difference when patching in the activation from a counterfactual example.
@@ -147,8 +147,8 @@ def analyze_head_effects(dataset, num_samples=50):
     for ex in sample_examples:
         prompt_orig = ex["prompt"]
         # Baseline performance on original prompt.
-        baseline_logits = get_logits(prompt_orig)
-        baseline_diff = get_logit_diff(baseline_logits, ex["correct_verb"], ex["incorrect_verb"])
+        baseline_logits = get_logits(prompt_orig, tokenizer=tokenizer, model=model)
+        baseline_diff = get_logit_diff(baseline_logits, ex["correct_verb"], ex["incorrect_verb"], tokenizer=tokenizer, model=model)
         # Generate counterfactual by flipping subject number.
         ex_cf = generate_counterfactual(ex)
         prompt_cf = ex_cf["prompt"]
@@ -156,7 +156,7 @@ def analyze_head_effects(dataset, num_samples=50):
         for layer in range(num_layers):
             for head in range(num_heads):
                 patched_diff = get_logit_diff_path_patch(layer, head, prompt_orig, prompt_cf,
-                                                         ex["correct_verb"], ex["incorrect_verb"])
+                                                         ex["correct_verb"], ex["incorrect_verb"], tokenizer=tokenizer, model=model)
                 effect = baseline_diff - patched_diff
                 head_effects[(layer, head)].append(effect)
     
@@ -167,7 +167,7 @@ def analyze_head_effects(dataset, num_samples=50):
     return results
 
 # Run the path patching analysis (using, e.g., 50 randomly sampled examples).
-head_effect_results = analyze_head_effects(dataset, num_samples=50)
+head_effect_results = analyze_head_effects(dataset, num_samples=50, tokenizer=tokenizer, model=model)
 df_effects = pd.DataFrame(head_effect_results)
 df_effects["abs_effect"] = df_effects["avg_effect"].abs()
 df_effects_sorted = df_effects.sort_values("abs_effect", ascending=False)
@@ -188,7 +188,7 @@ def zero_hook_factory(head_idx):
         return patched
     return hook
 
-def knockout_heads(heads, prompt):
+def knockout_heads(heads, prompt, tokenizer=tokenizer, model=model):
     """
     Given a list of heads (each a tuple (layer, head)), run a forward pass on the prompt with
     those heads zeroed out.
@@ -204,7 +204,7 @@ def knockout_heads(heads, prompt):
         handle.remove()
     return outputs.logits
 
-def analyze_knockout_effect(heads, dataset, num_samples=50):
+def analyze_knockout_effect(heads, dataset, num_samples=50, tokenizer=tokenizer, model=model):
     """
     For a given set of heads, compute the average effect on logit difference (baseline minus
     knockout) over a random sample from the dataset.
@@ -212,10 +212,10 @@ def analyze_knockout_effect(heads, dataset, num_samples=50):
     sample_examples = random.sample(dataset, num_samples)
     effects = []
     for ex in sample_examples:
-        baseline_logits = get_logits(ex["prompt"])
-        baseline_diff = get_logit_diff(baseline_logits, ex["correct_verb"], ex["incorrect_verb"])
-        knocked_logits = knockout_heads(heads, ex["prompt"])
-        knocked_diff = get_logit_diff(knocked_logits, ex["correct_verb"], ex["incorrect_verb"])
+        baseline_logits = get_logits(ex["prompt"], tokenizer=tokenizer, model=model)
+        baseline_diff = get_logit_diff(baseline_logits, ex["correct_verb"], ex["incorrect_verb"], tokenizer=tokenizer, model=model)
+        knocked_logits = knockout_heads(heads, ex["prompt"], tokenizer=tokenizer, model=model)
+        knocked_diff = get_logit_diff(knocked_logits, ex["correct_verb"], ex["incorrect_verb"], tokenizer=tokenizer, model=model)
         effects.append(baseline_diff - knocked_diff)
     avg_effect = sum(effects) / len(effects)
     return avg_effect
@@ -223,7 +223,7 @@ def analyze_knockout_effect(heads, dataset, num_samples=50):
 # For example, suppose we take the top 5 heads from our path patching analysis:
 top5 = df_effects_sorted.head(5)[["layer", "head"]].to_records(index=False)
 top5_list = [(int(x[0]), int(x[1])) for x in top5]
-knockout_effect = analyze_knockout_effect(top5_list, dataset, num_samples=50)
+knockout_effect = analyze_knockout_effect(top5_list, dataset, num_samples=50, tokenizer=tokenizer, model=model)
 print("\nAverage knockout effect for top 5 candidate heads:", knockout_effect)
 
 # =============================================================================
@@ -232,7 +232,7 @@ print("\nAverage knockout effect for top 5 candidate heads:", knockout_effect)
 # We then measure the model's average logit difference on a set of examples when only the circuit is active.
 # (This is done by knocking out all heads not in the circuit.)
 # =============================================================================
-def evaluate_circuit(circuit_heads, dataset, num_samples=50):
+def evaluate_circuit(circuit_heads, dataset, num_samples=50, tokenizer=tokenizer, model=model):
     """
     Evaluate a circuit (set of heads) by comparing:
       - F_full: average logit difference of the full model.
@@ -248,14 +248,14 @@ def evaluate_circuit(circuit_heads, dataset, num_samples=50):
     all_heads = [(layer, head) for layer in range(num_layers) for head in range(num_heads)]
     
     for ex in sample_examples:
-        baseline_logits = get_logits(ex["prompt"])
-        full_diff = get_logit_diff(baseline_logits, ex["correct_verb"], ex["incorrect_verb"])
+        baseline_logits = get_logits(ex["prompt"],  tokenizer=tokenizer, model=model)
+        full_diff = get_logit_diff(baseline_logits, ex["correct_verb"], ex["incorrect_verb"], tokenizer=tokenizer, model=model)
         full_diffs.append(full_diff)
         
         # Knockout all heads not in circuit.
         heads_to_knockout = [h for h in all_heads if h not in circuit_heads]
-        circuit_logits = knockout_heads(heads_to_knockout, ex["prompt"])
-        circuit_diff = get_logit_diff(circuit_logits, ex["correct_verb"], ex["incorrect_verb"])
+        circuit_logits = knockout_heads(heads_to_knockout, ex["prompt"], tokenizer=tokenizer, model=model)
+        circuit_diff = get_logit_diff(circuit_logits, ex["correct_verb"], ex["incorrect_verb"], tokenizer=tokenizer, model=model)
         circuit_diffs.append(circuit_diff)
     
     F_full = sum(full_diffs) / len(full_diffs)
@@ -264,6 +264,6 @@ def evaluate_circuit(circuit_heads, dataset, num_samples=50):
     return {"F_full": F_full, "F_circuit": F_circuit, "faithfulness": faithfulness}
 
 # For instance, evaluate the circuit formed by our top 5 heads:
-circuit_eval = evaluate_circuit(top5_list, dataset, num_samples=50)
+circuit_eval = evaluate_circuit(top5_list, dataset, num_samples=50, tokenizer=tokenizer, model=model)
 print("\nCircuit evaluation (top 5 heads):")
 print(circuit_eval)
