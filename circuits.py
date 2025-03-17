@@ -1,10 +1,12 @@
 import random
 import torch
 import pandas as pd
-from transformers import GPT2LMHeadModel, GPT2Tokenizer
-from dataset import generate_dataset_per_permutation
 import pickle
 import os
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from dataset import generate_dataset_per_permutation
 
 # =======================================
 # Load GPT-2 small and set to eval mode.
@@ -22,12 +24,12 @@ dataset = generate_dataset_per_permutation(samples_per_perm=100)
 # =======================================
 # Define cache file paths.
 # =======================================
-HEAD_EFFECT_CACHE = "attn_head_effect_results.pkl"
-MINIMAL_CIRCUIT_ZERO_CACHE = "minimal_circuit_zero.pkl"
-MINIMAL_CIRCUIT_MEAN_CACHE = "minimal_circuit_mean.pkl"
-MINIMAL_CIRCUIT_RESAMPLE_CACHE = "minimal_circuit_resample.pkl"
-ATTN_MEANS_CACHE = "attn_means.pkl"
-ATTN_SAMPLES_CACHE = "attn_samples.pkl"
+HEAD_EFFECT_CACHE = "results/attn_head_effect_results.pkl"
+MINIMAL_CIRCUIT_ZERO_CACHE = "results/minimal_circuit_zero.pkl"
+MINIMAL_CIRCUIT_MEAN_CACHE = "results/minimal_circuit_mean.pkl"
+MINIMAL_CIRCUIT_RESAMPLE_CACHE = "results/minimal_circuit_resample.pkl"
+ATTN_MEANS_CACHE = "results/attn_means.pkl"
+ATTN_SAMPLES_CACHE = "results/attn_samples.pkl"
 
 # =======================================
 # Helper functions for SVA evaluation.
@@ -87,8 +89,7 @@ def path_patch_head(layer_idx: int, head_idx: int, prompt_orig: str, prompt_patc
         batch_size, seq_len, _ = patched.shape
         patch_act = patch_activation if patch_activation.dim() == 3 else patch_activation.unsqueeze(0)
         min_seq_len = min(seq_len, patch_act.shape[1])
-        patched[:, :min_seq_len, head_idx * head_dim:(head_idx + 1) * head_dim] = \
-            patch_act[:, :min_seq_len, :]
+        patched[:, :min_seq_len, head_idx * head_dim:(head_idx + 1) * head_dim] = patch_act[:, :min_seq_len, :]
         if tuple_out:
             return (patched,) + rest
         return patched
@@ -268,7 +269,7 @@ def evaluate_attn_circuit(circuit_heads: list, dataset: list, num_samples: int =
     num_heads = model.config.n_head
     all_heads = [(layer, head) for layer in range(num_layers) for head in range(num_heads)]
     
-    for ex in sample_examples:
+    for ex in tqdm(sample_examples, desc="Evaluating circuit examples"):
         baseline_logits = get_logits(ex["prompt"])
         full_diff = compute_logit_diff(baseline_logits, ex["correct_verb"], ex["incorrect_verb"])
         full_diffs.append(full_diff)
@@ -302,8 +303,8 @@ def compute_all_attn_means(dataset, num_samples=50):
     num_layers = len(model.transformer.h)
     num_heads = model.config.n_head
     attn_means = {layer: {} for layer in range(num_layers)}
-    for layer in range(num_layers):
-        for head in range(num_heads):
+    for layer in tqdm(range(num_layers), desc="Computing attn means per layer"):
+        for head in tqdm(range(num_heads), desc=f"Layer {layer} heads", leave=False):
             mean_act = compute_attn_head_mean_activation(layer, head, dataset, num_samples)
             attn_means[layer][head] = mean_act
             print(f"Computed mean for layer {layer}, head {head}")
@@ -313,8 +314,8 @@ def compute_all_attn_samples(dataset, num_samples=50, tokens_per_example=5):
     num_layers = len(model.transformer.h)
     num_heads = model.config.n_head
     attn_samples = {layer: {} for layer in range(num_layers)}
-    for layer in range(num_layers):
-        for head in range(num_heads):
+    for layer in tqdm(range(num_layers), desc="Collecting attn samples per layer"):
+        for head in tqdm(range(num_heads), desc=f"Layer {layer} heads", leave=False):
             samples = compute_attn_head_samples(layer, head, dataset, num_samples, tokens_per_example)
             attn_samples[layer][head] = samples
             print(f"Collected {len(samples)} samples for layer {layer}, head {head}")
@@ -356,7 +357,7 @@ else:
 # =======================================
 # Minimal Circuit Search with Beam Search for Attention Heads.
 # =======================================
-def find_minimal_attn_circuit_beam(sorted_heads, dataset, threshold=0.1, beam_size=5, num_samples=50, method="zero"):
+def find_minimal_attn_circuit_beam(sorted_heads, dataset, threshold=0.1, beam_size=10, num_samples=50, method="zero"):
     # Get baseline performance.
     full_eval = evaluate_attn_circuit([], dataset, num_samples=num_samples, method=method,
                                       attn_means=attn_means, attn_samples=attn_samples)
@@ -365,7 +366,7 @@ def find_minimal_attn_circuit_beam(sorted_heads, dataset, threshold=0.1, beam_si
     best_candidate = None
     best_diff = float('inf')
     # Initialize beam with each single head candidate.
-    for head in sorted_heads:
+    for head in tqdm(sorted_heads, desc="Evaluating single head candidates"):
         candidate = [head]
         eval_candidate = evaluate_attn_circuit(candidate, dataset, num_samples=num_samples, method=method,
                                                attn_means=attn_means, attn_samples=attn_samples)
@@ -379,7 +380,7 @@ def find_minimal_attn_circuit_beam(sorted_heads, dataset, threshold=0.1, beam_si
     while improved:
         new_beam = []
         improved = False
-        for candidate, cand_diff in beam:
+        for candidate, cand_diff in tqdm(beam, desc="Exploring beam candidates"):
             for head in sorted_heads:
                 if head in candidate:
                     continue
@@ -410,7 +411,7 @@ else:
         num_layers = len(model.transformer.h)
         num_heads = model.config.n_head
         head_effects = {(layer, head): [] for layer in range(num_layers) for head in range(num_heads)}
-        for ex in sample_examples:
+        for ex in tqdm(sample_examples, desc="Analyzing head effects"):
             prompt_orig = ex["prompt"]
             baseline_logits = get_logits(prompt_orig)
             baseline_diff = compute_logit_diff(baseline_logits, ex["correct_verb"], ex["incorrect_verb"])
@@ -437,6 +438,23 @@ df_effects_sorted = df_effects.sort_values("abs_effect", ascending=False)
 print("=== Path Patching Analysis Results (per head) ===")
 print(df_effects_sorted)
 
+# ----------------------------
+# Generate and save a heatmap of attention head effects.
+# ----------------------------
+heatmap_data = df_effects.pivot(index='layer', columns='head', values='avg_effect')
+plt.figure(figsize=(10, 8))
+plt.imshow(heatmap_data, cmap='viridis', aspect='auto')
+plt.colorbar()
+plt.title("Attention Head Average Effects")
+plt.xlabel("Head")
+plt.ylabel("Layer")
+plt.xticks(range(heatmap_data.shape[1]), heatmap_data.columns)
+plt.yticks(range(heatmap_data.shape[0]), heatmap_data.index)
+plt.savefig("attn_heatmap.png")
+plt.close()
+print("Saved heatmap as attn_heatmap.png")
+# ----------------------------
+
 sorted_candidate_heads = [(int(row["layer"]), int(row["head"])) for _, row in df_effects_sorted.iterrows()]
 
 # Now, for each ablation method, run the minimal circuit search and save the result.
@@ -457,7 +475,7 @@ for method in methods:
         print(f"Loaded cached result for method '{method}'")
     else:
         minimal_circuit, minimal_eval = find_minimal_attn_circuit_beam(
-            sorted_candidate_heads, dataset, threshold=0.1, beam_size=5, num_samples=50, method=method
+            sorted_candidate_heads, dataset, threshold=0.1, beam_size=10, num_samples=50, method=method
         )
         save_results(cache_file, (minimal_circuit, minimal_eval))
     minimal_results[method] = (minimal_circuit, minimal_eval)
@@ -468,3 +486,4 @@ for method in methods:
 # Optionally, save all minimal circuit results together.
 with open("all_minimal_circuits.pkl", "wb") as f:
     pickle.dump(minimal_results, f)
+print("Saved all minimal circuit results as all_minimal_circuits.pkl")
