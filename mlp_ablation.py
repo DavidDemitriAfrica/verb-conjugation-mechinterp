@@ -6,29 +6,19 @@ import os
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 from dataset import generate_dataset_per_permutation
 
-# =======================================
-# Load GPT-2 small and set to eval mode.
-# =======================================
+# attempted, not really successful
+
 model_name = "gpt2"
 model = GPT2LMHeadModel.from_pretrained(model_name)
 tokenizer = GPT2Tokenizer.from_pretrained(model_name)
 model.eval()
 
-# =======================================
-# Generate dataset (100 samples per permutation)
-# =======================================
 dataset = generate_dataset_per_permutation(samples_per_perm=100)
 
-# =======================================
-# Caching file paths
-# =======================================
 MLP_MEAN_CACHE = "results/mlp_mean_activations.pkl"
 MLP_SAMPLES_CACHE = "results/mlp_activation_samples.pkl"
 MLP_ABLATION_RESULTS_CACHE = "results/mlp_ablation_results.pkl"
 
-# =======================================
-# Helper functions: SVA evaluation
-# =======================================
 def get_logits(prompt: str):
     inputs = tokenizer(prompt, return_tensors="pt")
     with torch.no_grad():
@@ -42,9 +32,6 @@ def compute_logit_diff(logits, correct_word: str, incorrect_word: str):
     logit_incorrect = logits[0, -1, incorrect_id].item()
     return logit_correct - logit_incorrect
 
-# =======================================
-# Functions to compute and cache MLP activations.
-# =======================================
 
 def compute_mlp_mean_activation(layer_idx: int, dataset, num_samples: int = 50):
     """
@@ -94,9 +81,6 @@ def compute_mlp_activation_samples(layer_idx: int, dataset, num_samples: int = 5
     handle.remove()
     return samples
 
-# =======================================
-# Hook factories for MLP ablation methods.
-# =======================================
 
 def mlp_zero_hook_factory(layer_idx: int):
     """Zero ablation: replace MLP output with zeros."""
@@ -130,9 +114,6 @@ def mlp_resample_hook_factory(layer_idx: int, sample_list: list):
         return sample_expanded
     return hook
 
-# =======================================
-# Compute (or load) cached MLP activations for mean and resampling.
-# =======================================
 def load_or_compute_mlp_means(num_layers: int, dataset, num_samples=50):
     means = {}
     cached = load_results(MLP_MEAN_CACHE)
@@ -155,9 +136,6 @@ def load_or_compute_mlp_samples(num_layers: int, dataset, num_samples=50, tokens
     save_results(MLP_SAMPLES_CACHE, samples)
     return samples
 
-# =======================================
-# Caching functions.
-# =======================================
 def save_results(filename, data):
     with open(filename, "wb") as f:
         pickle.dump(data, f)
@@ -168,12 +146,6 @@ def load_results(filename):
             return pickle.load(f)
     return None
 
-# =======================================
-# MLP Ablation Analysis.
-# For each MLP layer, compute the effect on the logit difference when the MLP is ablated using
-# each of three methods: zero, mean, and resampling.
-# Effect is defined as: baseline logit diff - ablated logit diff.
-# =======================================
 def analyze_mlp_ablation(dataset: list, num_samples: int = 50):
     num_layers = model.config.n_layer
     results = []
